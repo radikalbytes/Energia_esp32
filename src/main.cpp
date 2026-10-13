@@ -46,11 +46,16 @@ const unsigned int SAMPLES = 1000; // ~1.2s a 860 SPS, suficiente para varios ci
 float adcOffset = 1.65; // se autoajusta con un filtro paso-alto en calcIrms()
 
 void conectarWifi() {
+  Serial.printf("Conectando a WiFi '%s'", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
+    Serial.print(".");
   }
+  Serial.printf("\nWiFi conectado. IP: %s, RSSI: %d dBm\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
 }
 
 // Calcula la corriente RMS eliminando el offset DC mediante un filtro paso-alto,
@@ -101,6 +106,8 @@ bool enviarMedicion(float irms, float potencia, float temperatura, float humedad
 
 void setup() {
   Serial.begin(115200);
+  delay(2000); // da tiempo a que el monitor USB se conecte
+  Serial.println("Arrancando...");
   conectarWifi();
 
   dht.begin();
