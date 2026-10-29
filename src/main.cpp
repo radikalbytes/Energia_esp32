@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 #include <HTTPClient.h>
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
@@ -50,17 +53,137 @@ const float NOISE_FLOOR_A = 0.05;              // por debajo se considera ruido 
 const unsigned long SERIAL_INTERVAL_MS = 30000; // medida + informe por puerto serie
 const unsigned long SEND_INTERVAL_MS = 60000;   // envío al servidor
 
-void conectarWifi() {
-  Serial.printf("Conectando a WiFi '%s'", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+// ---------- Portal de configuración WiFi ----------
+const char* AP_NAME = "Voltio_monitor";
+const unsigned long PORTAL_WINDOW_MS = 60000; // el punto de acceso está activo 60 s tras el reset
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 
-  while (WiFi.status() != WL_CONNECTED) {
+Preferences prefs;
+String wifiSsid;
+String wifiPass;
+
+void cargarCredenciales() {
+  prefs.begin("wifi", true);
+  wifiSsid = prefs.getString("ssid", "");
+  wifiPass = prefs.getString("pass", "");
+  prefs.end();
+  if (wifiSsid.isEmpty()) { // valores por defecto de secrets.h
+    wifiSsid = WIFI_SSID;
+    wifiPass = WIFI_PASSWORD;
+  }
+}
+
+void guardarCredenciales(const String& ssid, const String& pass) {
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+}
+
+String htmlEscape(String v) {
+  v.replace("&", "&amp;");
+  v.replace("<", "&lt;");
+  v.replace(">", "&gt;");
+  v.replace("\"", "&quot;");
+  return v;
+}
+
+String paginaPortal(int n) {
+  String h = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<title>Voltio</title><style>"
+             "body{font-family:system-ui;background:#0f172a;color:#e2e8f0;max-width:420px;margin:0 auto;padding:20px}"
+             "h1{color:#facc15}select,input,button{width:100%;padding:12px;margin:8px 0;border-radius:10px;border:0;font-size:16px;box-sizing:border-box}"
+             "button{background:#facc15;font-weight:700}a{color:#facc15}</style></head><body>"
+             "<h1>&#9889; Voltio monitor</h1><p>Elige tu red WiFi:</p>"
+             "<form method='POST' action='/save'><select name='ssid'>";
+  for (int i = 0; i < n; i++) {
+    String name = WiFi.SSID(i);
+    if (name.isEmpty()) continue;
+    h += "<option value=\"" + htmlEscape(name) + "\">" + htmlEscape(name) + " (" + String(WiFi.RSSI(i)) + " dBm" +
+         (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "" : ", &#128274;") + ")</option>";
+  }
+  h += "</select><input type='password' name='pass' placeholder='Contrase&ntilde;a'>"
+       "<button type='submit'>Guardar y conectar</button></form>"
+       "<p><a href='/'>Buscar redes de nuevo</a></p></body></html>";
+  return h;
+}
+
+void portalConfiguracion() {
+  WebServer server(80);
+  DNSServer dns;
+  bool guardado = false;
+  int redes = 0;
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_NAME);
+  dns.start(53, "*", WiFi.softAPIP());
+  Serial.printf("Portal WiFi '%s' activo %lu s en http://%s\n", AP_NAME, PORTAL_WINDOW_MS / 1000,
+                WiFi.softAPIP().toString().c_str());
+
+  redes = WiFi.scanNetworks();
+
+  server.on("/", HTTP_GET, [&]() {
+    redes = WiFi.scanNetworks();
+    server.send(200, "text/html", paginaPortal(redes));
+  });
+  server.on("/save", HTTP_POST, [&]() {
+    String ssid = server.arg("ssid");
+    if (ssid.isEmpty()) {
+      server.send(400, "text/plain", "Falta la red");
+      return;
+    }
+    guardarCredenciales(ssid, server.arg("pass"));
+    wifiSsid = ssid;
+    wifiPass = server.arg("pass");
+    guardado = true;
+    server.send(200, "text/html",
+                "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                "<body style='font-family:system-ui;background:#0f172a;color:#e2e8f0;padding:20px'>"
+                "<h2>Guardado</h2><p>El monitor se conecta ahora a la red elegida.</p></body>");
+  });
+  server.onNotFound([&]() { // portal cautivo: redirige todo a la página de configuración
+    server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+    server.send(302, "text/plain", "");
+  });
+  server.begin();
+
+  unsigned long fin = millis() + PORTAL_WINDOW_MS;
+  unsigned long finGuardado = 0;
+  while (true) {
+    dns.processNextRequest();
+    server.handleClient();
+    if (guardado && finGuardado == 0) finGuardado = millis() + 2000; // deja enviar la respuesta
+    if (finGuardado && (long)(millis() - finGuardado) >= 0) break;
+    // Si hay alguien conectado al portal, no se cierra hasta que termine
+    if (WiFi.softAPgetStationNum() > 0) fin = millis() + PORTAL_WINDOW_MS;
+    if (!guardado && (long)(millis() - fin) >= 0) break;
+    delay(2);
+  }
+  server.stop();
+  dns.stop();
+  WiFi.scanDelete();
+  WiFi.softAPdisconnect(true);
+  Serial.println("Portal WiFi cerrado");
+}
+
+bool conectarWifi() {
+  Serial.printf("Conectando a WiFi '%s'", wifiSsid.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - inicio < WIFI_CONNECT_TIMEOUT_MS) {
     delay(500);
     Serial.print(".");
   }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nNo se pudo conectar a la WiFi");
+    return false;
+  }
   Serial.printf("\nWiFi conectado. IP: %s, RSSI: %d dBm\n",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  return true;
 }
 
 struct CurrentStats {
@@ -127,8 +250,8 @@ void informarCorriente(const CurrentStats& c) {
 }
 
 bool enviarMedicion(float irms, float potencia, float temperatura, float humedad) {
-  if (WiFi.status() != WL_CONNECTED) {
-    conectarWifi();
+  if (WiFi.status() != WL_CONNECTED && !conectarWifi()) {
+    return false;
   }
 
   HTTPClient http;
@@ -158,7 +281,13 @@ void setup() {
   Serial.begin(115200);
   delay(2000); // da tiempo a que el monitor USB se conecte
   Serial.println("Arrancando...");
-  conectarWifi();
+  cargarCredenciales();
+  portalConfiguracion();
+  if (!conectarWifi()) {
+    // Credenciales erróneas: reabre el portal para poder corregirlas
+    portalConfiguracion();
+    conectarWifi();
+  }
 
   dht.begin();
 
