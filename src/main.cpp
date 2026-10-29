@@ -6,12 +6,14 @@
 #include <DHT.h>
 
 // ---------- WiFi / API ----------
-const char* WIFI_SSID = "TU_WIFI";
-const char* WIFI_PASSWORD = "TU_CONTRASENA";
+// Las credenciales están en include/secrets.h (ignorado por git; ver secrets.example.h).
+#include "secrets.h"
+const char* WIFI_SSID = WIFI_SSID_VALUE;
+const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
 
 // Local: sustituye por la IP de tu ordenador.
 // Producción: https://energy-monitoring.vercel.app/api/data
-const char* API_URL = "http://192.168.1.100:3000/api/data";
+const char* API_URL = "https://energy-monitoring.vercel.app/api/data"; //"http://192.168.1.100:3000/api/data";
 
 #define PROCESSOR_ESP32_C3 1
 #define PROCESSOR_ESP32_S3 2
@@ -30,6 +32,7 @@ const char* DEVICE_UUID = "esp32-s3-salon-001";
 #define DHT_PIN 4
 #define DHT_TYPE DHT22
 DHT dht(DHT_PIN, DHT_TYPE);
+#define HUMIDITY_MAX_VALID 95.0f  // por encima, el sensor suele estar saturado
 
 // ---------- ADS1115 + SCT-013-030 ----------
 Adafruit_ADS1115 ads;
@@ -41,9 +44,11 @@ Adafruit_ADS1115 ads;
 const float CT_CALIBRATION = 30.0; // Amperios por voltio leído
 const float MAINS_VOLTAGE = 230.0; // Tensión de red asumida (no se mide)
 
-const unsigned int SAMPLES = 1000; // ~1.2s a 860 SPS, suficiente para varios ciclos de 50Hz
+const unsigned long MEASURE_WINDOW_MS = 1000; // 1 s = 50 ciclos exactos de 50 Hz
+const float NOISE_FLOOR_A = 0.05;              // por debajo se considera ruido (0 A)
 
-float adcOffset = 1.65; // se autoajusta con un filtro paso-alto en calcIrms()
+const unsigned long SERIAL_INTERVAL_MS = 30000; // medida + informe por puerto serie
+const unsigned long SEND_INTERVAL_MS = 60000;   // envío al servidor
 
 void conectarWifi() {
   Serial.printf("Conectando a WiFi '%s'", WIFI_SSID);
@@ -58,23 +63,67 @@ void conectarWifi() {
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
 }
 
-// Calcula la corriente RMS eliminando el offset DC mediante un filtro paso-alto,
-// igual que hace la librería EmonLib de OpenEnergyMonitor.
-float calcIrms(unsigned int numberOfSamples) {
-  double sumSq = 0;
+struct CurrentStats {
+  float irms;     // A (ya filtrado el ruido)
+  float irmsRaw;  // A sin filtrar
+  float vrms;     // V RMS de la componente alterna en el ADC
+  float offset;   // V de polarización (media de la señal)
+  float vMin, vMax;
+  unsigned samples;
+  float sps;
+};
 
-  for (unsigned int i = 0; i < numberOfSamples; i++) {
-    int16_t raw = ads.readADC_SingleEnded(SCT_CHANNEL);
-    double sample = ads.computeVolts(raw);
+// RMS de la componente alterna en una ventana de tiempo fija (ciclos enteros de red):
+// Vrms = sqrt(E[x^2] - E[x]^2). Elimina el offset DC exacto de la ventana, sin
+// depender de un filtro que tarda en converger tras arrancar.
+CurrentStats medirCorriente(unsigned long windowMs) {
+  double sum = 0, sumSq = 0;
+  float vMin = 99, vMax = -99;
+  unsigned n = 0;
+  unsigned long t0 = millis();
 
-    adcOffset += (sample - adcOffset) / 1024.0;
-    double filteredSample = sample - adcOffset;
-
-    sumSq += filteredSample * filteredSample;
+  while (millis() - t0 < windowMs) {
+    float v = ads.computeVolts(ads.readADC_SingleEnded(SCT_CHANNEL));
+    sum += v;
+    sumSq += (double)v * v;
+    if (v < vMin) vMin = v;
+    if (v > vMax) vMax = v;
+    n++;
   }
+  unsigned long elapsed = millis() - t0;
 
-  double rmsVoltage = sqrt(sumSq / numberOfSamples);
-  return rmsVoltage * CT_CALIBRATION;
+  CurrentStats r = {};
+  if (n == 0) return r;
+  double mean = sum / n;
+  double var = sumSq / n - mean * mean;
+  if (var < 0) var = 0;
+  r.vrms = sqrt(var);
+  r.offset = mean;
+  r.vMin = vMin;
+  r.vMax = vMax;
+  r.samples = n;
+  r.sps = n * 1000.0f / elapsed;
+  r.irmsRaw = r.vrms * CT_CALIBRATION;
+  r.irms = r.irmsRaw < NOISE_FLOOR_A ? 0 : r.irmsRaw;
+  return r;
+}
+
+void informarCorriente(const CurrentStats& c) {
+  Serial.printf("[I] Irms=%.3f A (bruta %.3f) | P=%.1f W | Vac=%.1f mV | offset=%.3f V | rango=%.3f..%.3f V | %u muestras (%.0f SPS)\n",
+                c.irms, c.irmsRaw, c.irms * MAINS_VOLTAGE, c.vrms * 1000.0f, c.offset, c.vMin, c.vMax, c.samples, c.sps);
+  if (c.samples == 0) {
+    Serial.println("[!] Sin muestras del ADS1115, revisa el I2C");
+  } else {
+    if (c.offset < 1.4f || c.offset > 1.9f) {
+      Serial.println("[!] Offset lejos de 1.65 V: revisa el divisor de polarizacion del SCT-013");
+    }
+    if (c.vMin < 0.05f || c.vMax > 3.25f) {
+      Serial.println("[!] Senal cerca de saturacion/recorte (corriente excesiva o polarizacion incorrecta)");
+    }
+    if (c.sps < 300) {
+      Serial.println("[!] Frecuencia de muestreo baja, la medida puede ser imprecisa");
+    }
+  }
 }
 
 bool enviarMedicion(float irms, float potencia, float temperatura, float humedad) {
@@ -84,6 +133,7 @@ bool enviarMedicion(float irms, float potencia, float temperatura, float humedad
 
   HTTPClient http;
   http.begin(API_URL);
+  http.setTimeout(10000);
   http.addHeader("Content-Type", "application/json");
 
   String payload = "{";
@@ -123,19 +173,41 @@ void setup() {
 }
 
 void loop() {
-  float irms = calcIrms(SAMPLES);
-  float potencia = irms * MAINS_VOLTAGE;
+  static unsigned long nextMeasure = 0;
+  static unsigned long lastSend = 0;
+  static double irmsSum = 0;
+  static unsigned irmsCount = 0;
 
-  float temperatura = dht.readTemperature();
-  float humedad = dht.readHumidity();
-
-  if (isnan(temperatura) || isnan(humedad)) {
-    Serial.println("Error leyendo el DHT22");
-    temperatura = 0;
-    humedad = 0;
+  if ((long)(millis() - nextMeasure) >= 0) {
+    nextMeasure = millis() + SERIAL_INTERVAL_MS;
+    CurrentStats c = medirCorriente(MEASURE_WINDOW_MS);
+    informarCorriente(c);
+    irmsSum += c.irms;
+    irmsCount++;
   }
 
-  enviarMedicion(irms, potencia, temperatura, humedad);
+  if (irmsCount > 0 && millis() - lastSend >= SEND_INTERVAL_MS) {
+    lastSend = millis();
+    float irms = irmsSum / irmsCount;
+    float potencia = irms * MAINS_VOLTAGE;
+    irmsSum = 0;
+    irmsCount = 0;
 
-  delay(300000); // 5 minutos
+    float temperatura = dht.readTemperature();
+    float humedad = dht.readHumidity();
+
+    if (isnan(temperatura) || isnan(humedad)) {
+      Serial.println("Error leyendo el DHT22");
+      temperatura = 0;
+      humedad = 0;
+    } else if (temperatura < -40 || temperatura > 80 || humedad < 0 || humedad > HUMIDITY_MAX_VALID) {
+      // Humedad saturada o fuera de rango: sensor mojado/defectuoso. Se envía 0 (= sin dato).
+      Serial.printf("Humedad no fiable (%.1f%%), se descarta\n", humedad);
+      humedad = 0;
+    }
+
+    enviarMedicion(irms, potencia, temperatura, humedad);
+  }
+
+  delay(10);
 }
