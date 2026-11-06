@@ -17,8 +17,9 @@ const char* WIFI_SSID = WIFI_SSID_VALUE;
 const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
 // Contraseña de las actualizaciones OTA (usuario "admin"). Define OTA_PASSWORD_VALUE en secrets.h.
 #ifndef OTA_PASSWORD_VALUE
-#define OTA_PASSWORD_VALUE "voltio"
+#error "Define OTA_PASSWORD_VALUE in include/secrets.h"
 #endif
+static_assert(sizeof(OTA_PASSWORD_VALUE) > 1, "OTA_PASSWORD_VALUE must not be empty");
 const char* OTA_PASSWORD = OTA_PASSWORD_VALUE;
 
 // Local: sustituye por la IP de tu ordenador.
