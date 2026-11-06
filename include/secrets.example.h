@@ -4,3 +4,4 @@
 // include/secrets.h está ignorado por git.
 #define WIFI_SSID_VALUE "TU_WIFI"
 #define WIFI_PASSWORD_VALUE "TU_CONTRASENA"
+#define OTA_PASSWORD_VALUE "password_OTA"

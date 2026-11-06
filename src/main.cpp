@@ -7,12 +7,19 @@
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
 #include <DHT.h>
+#include <Update.h>
+#include <ArduinoOTA.h>
 
 // ---------- WiFi / API ----------
 // Las credenciales están en include/secrets.h (ignorado por git; ver secrets.example.h).
 #include "secrets.h"
 const char* WIFI_SSID = WIFI_SSID_VALUE;
 const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
+// Contraseña de las actualizaciones OTA (usuario "admin"). Define OTA_PASSWORD_VALUE en secrets.h.
+#ifndef OTA_PASSWORD_VALUE
+#define OTA_PASSWORD_VALUE "voltio"
+#endif
+const char* OTA_PASSWORD = OTA_PASSWORD_VALUE;
 
 // Local: sustituye por la IP de tu ordenador.
 // Producción: https://energy-monitoring.vercel.app/api/data
@@ -39,18 +46,24 @@ DHT dht(DHT_PIN, DHT_TYPE);
 
 // ---------- ADS1115 + SCT-013-030 ----------
 Adafruit_ADS1115 ads;
-#define SCT_CHANNEL 0
 
 // El SCT-013-030 (versión 3.5mm) entrega 1 Vrms a 30 A (burden resistor integrado).
 // El ADS1115 solo mide 0-Vref, por lo que la señal debe polarizarse a mitad de
 // escala (~1.65V) con un divisor resistivo + condensador antes de entrar al ADC.
-const float CT_CALIBRATION = 30.0; // Amperios por voltio leído
-const float MAINS_VOLTAGE = 230.0; // Tensión de red asumida (no se mide)
+// Lectura DIFERENCIAL A0-A1 (igual que el sketch básico verificado): el offset de
+// polarización se anula y la señal queda centrada en 0 V.
+// Todos estos valores son ajustables desde la web (se guardan en flash).
+struct Settings {
+  float calibration = 30.0f;     // A por voltio (30 A / 1 V)
+  float correction = 1.0f;       // factor de corrección de corriente (1.0 = sin corrección)
+  float noiseFloor = 0.05f;      // A; por debajo se considera ruido (0 A)
+  float mains = 230.0f;          // V; tensión de red asumida (no se mide)
+  float powerFactor = 1.0f;      // factor de potencia para P = V * I * FP
+  unsigned serialInterval = 30;  // s entre medidas mostradas por serie
+} cfg;
 
 const unsigned long MEASURE_WINDOW_MS = 1000; // 1 s = 50 ciclos exactos de 50 Hz
-const float NOISE_FLOOR_A = 0.05;              // por debajo se considera ruido (0 A)
 
-const unsigned long SERIAL_INTERVAL_MS = 30000; // medida + informe por puerto serie
 const unsigned long SEND_INTERVAL_MS = 60000;   // envío al servidor
 
 // ---------- Portal de configuración WiFi ----------
@@ -80,6 +93,71 @@ void guardarCredenciales(const String& ssid, const String& pass) {
   prefs.end();
 }
 
+void cargarAjustes() {
+  prefs.begin("cfg", false);
+  cfg.calibration = prefs.getFloat("cal", cfg.calibration);
+  cfg.correction = prefs.getFloat("corr", cfg.correction);
+  cfg.noiseFloor = prefs.getFloat("noise", cfg.noiseFloor);
+  cfg.mains = prefs.getFloat("mains", cfg.mains);
+  cfg.powerFactor = prefs.getFloat("pf", cfg.powerFactor);
+  cfg.serialInterval = prefs.getUInt("sint", cfg.serialInterval);
+  prefs.end();
+}
+
+void guardarAjustes() {
+  prefs.begin("cfg", false);
+  prefs.putFloat("cal", cfg.calibration);
+  prefs.putFloat("corr", cfg.correction);
+  prefs.putFloat("noise", cfg.noiseFloor);
+  prefs.putFloat("mains", cfg.mains);
+  prefs.putFloat("pf", cfg.powerFactor);
+  prefs.putUInt("sint", cfg.serialInterval);
+  prefs.end();
+}
+
+// ---------- Redes WiFi guardadas ----------
+const int MAX_REDES_GUARDADAS = 8;
+
+int buscarRedGuardada(const String& ssid) {
+  prefs.begin("nets", false);
+  int n = prefs.getUChar("n", 0);
+  int found = -1;
+  for (int i = 0; i < n && found < 0; i++) {
+    if (prefs.getString(("s" + String(i)).c_str(), "") == ssid) found = i;
+  }
+  prefs.end();
+  return found;
+}
+
+String passRedGuardada(const String& ssid) {
+  int i = buscarRedGuardada(ssid);
+  if (i < 0) return "";
+  prefs.begin("nets", false);
+  String p = prefs.getString(("p" + String(i)).c_str(), "");
+  prefs.end();
+  return p;
+}
+
+void guardarRed(const String& ssid, const String& pass) {
+  int idx = buscarRedGuardada(ssid);
+  prefs.begin("nets", false);
+  int n = prefs.getUChar("n", 0);
+  if (idx < 0) {
+    if (n >= MAX_REDES_GUARDADAS) { // llena: descarta la más antigua
+      for (int i = 1; i < n; i++) {
+        prefs.putString(("s" + String(i - 1)).c_str(), prefs.getString(("s" + String(i)).c_str(), ""));
+        prefs.putString(("p" + String(i - 1)).c_str(), prefs.getString(("p" + String(i)).c_str(), ""));
+      }
+      n--;
+    }
+    idx = n++;
+    prefs.putUChar("n", n);
+  }
+  prefs.putString(("s" + String(idx)).c_str(), ssid);
+  prefs.putString(("p" + String(idx)).c_str(), pass);
+  prefs.end();
+}
+
 String htmlEscape(String v) {
   v.replace("&", "&amp;");
   v.replace("<", "&lt;");
@@ -94,18 +172,31 @@ String paginaPortal(int n) {
              "<title>Voltio</title><style>"
              "body{font-family:system-ui;background:#0f172a;color:#e2e8f0;max-width:420px;margin:0 auto;padding:20px}"
              "h1{color:#facc15}select,input,button{width:100%;padding:12px;margin:8px 0;border-radius:10px;border:0;font-size:16px;box-sizing:border-box}"
-             "button{background:#facc15;font-weight:700}a{color:#facc15}</style></head><body>"
+             "button{background:#facc15;font-weight:700}a{color:#facc15}label{display:block;margin:6px 0}"
+             "input[type=radio]{width:auto;margin-right:8px}</style></head><body>"
              "<h1>&#9889; Voltio monitor</h1><p>Elige tu red WiFi:</p>"
-             "<form method='POST' action='/save'><select name='ssid'>";
+             "<form method='POST' action='/save'><select name='ssid' id='ssid'>";
   for (int i = 0; i < n; i++) {
     String name = WiFi.SSID(i);
     if (name.isEmpty()) continue;
-    h += "<option value=\"" + htmlEscape(name) + "\">" + htmlEscape(name) + " (" + String(WiFi.RSSI(i)) + " dBm" +
+    bool saved = buscarRedGuardada(name) >= 0;
+    h += "<option data-saved='" + String(saved ? 1 : 0) + "' value=\"" + htmlEscape(name) + "\">" +
+         (saved ? "&#9733; " : "") + htmlEscape(name) + " (" + String(WiFi.RSSI(i)) + " dBm" +
          (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "" : ", &#128274;") + ")</option>";
   }
-  h += "</select><input type='password' name='pass' placeholder='Contrase&ntilde;a'>"
+  h += "</select><div id='sv' style='display:none'>"
+       "<label><input type='radio' name='mode' value='saved' checked>Usar contrase&ntilde;a guardada</label>"
+       "<label><input type='radio' name='mode' value='new'>Introducir una nueva</label></div>"
+       "<input type='password' name='pass' id='pass' placeholder='Contrase&ntilde;a'>"
        "<button type='submit'>Guardar y conectar</button></form>"
-       "<p><a href='/'>Buscar redes de nuevo</a></p></body></html>";
+       "<p><a href='/'>Buscar redes de nuevo</a></p>"
+       "<script>var s=document.getElementById('ssid'),v=document.getElementById('sv'),p=document.getElementById('pass');"
+       "function u(){var sv=s.selectedOptions.length&&s.selectedOptions[0].dataset.saved==='1';"
+       "v.style.display=sv?'block':'none';"
+       "var m=document.querySelector('input[name=mode]:checked').value;"
+       "p.style.display=(sv&&m==='saved')?'none':'block';}"
+       "s.onchange=u;document.querySelectorAll('input[name=mode]').forEach(function(r){r.onchange=u;});u();"
+       "</script></body></html>";
   return h;
 }
 
@@ -133,9 +224,12 @@ void portalConfiguracion() {
       server.send(400, "text/plain", "Falta la red");
       return;
     }
-    guardarCredenciales(ssid, server.arg("pass"));
+    String pass = server.arg("pass");
+    if (server.arg("mode") == "saved" && buscarRedGuardada(ssid) >= 0) pass = passRedGuardada(ssid);
+    guardarCredenciales(ssid, pass);
+    guardarRed(ssid, pass);
     wifiSsid = ssid;
-    wifiPass = server.arg("pass");
+    wifiPass = pass;
     guardado = true;
     server.send(200, "text/html",
                 "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -183,8 +277,11 @@ bool conectarWifi() {
   }
   Serial.printf("\nWiFi conectado. IP: %s, RSSI: %d dBm\n",
                 WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  if (buscarRedGuardada(wifiSsid) < 0) guardarRed(wifiSsid, wifiPass);
   return true;
 }
+
+float potenciaDe(float irms) { return irms * cfg.mains * cfg.powerFactor; }
 
 struct CurrentStats {
   float irms;     // A (ya filtrado el ruido)
@@ -206,7 +303,7 @@ CurrentStats medirCorriente(unsigned long windowMs) {
   unsigned long t0 = millis();
 
   while (millis() - t0 < windowMs) {
-    float v = ads.computeVolts(ads.readADC_SingleEnded(SCT_CHANNEL));
+    float v = ads.computeVolts(ads.readADC_Differential_0_1());
     sum += v;
     sumSq += (double)v * v;
     if (v < vMin) vMin = v;
@@ -226,27 +323,111 @@ CurrentStats medirCorriente(unsigned long windowMs) {
   r.vMax = vMax;
   r.samples = n;
   r.sps = n * 1000.0f / elapsed;
-  r.irmsRaw = r.vrms * CT_CALIBRATION;
-  r.irms = r.irmsRaw < NOISE_FLOOR_A ? 0 : r.irmsRaw;
+  r.irmsRaw = r.vrms * cfg.calibration;
+  r.irms = r.irmsRaw < cfg.noiseFloor ? 0 : r.irmsRaw * cfg.correction;
   return r;
 }
 
 void informarCorriente(const CurrentStats& c) {
   Serial.printf("[I] Irms=%.3f A (bruta %.3f) | P=%.1f W | Vac=%.1f mV | offset=%.3f V | rango=%.3f..%.3f V | %u muestras (%.0f SPS)\n",
-                c.irms, c.irmsRaw, c.irms * MAINS_VOLTAGE, c.vrms * 1000.0f, c.offset, c.vMin, c.vMax, c.samples, c.sps);
+                c.irms, c.irmsRaw, potenciaDe(c.irms), c.vrms * 1000.0f, c.offset, c.vMin, c.vMax, c.samples, c.sps);
   if (c.samples == 0) {
     Serial.println("[!] Sin muestras del ADS1115, revisa el I2C");
   } else {
-    if (c.offset < 1.4f || c.offset > 1.9f) {
-      Serial.println("[!] Offset lejos de 1.65 V: revisa el divisor de polarizacion del SCT-013");
+    if (fabsf(c.offset) > 0.3f) {
+      Serial.println("[!] Offset diferencial alto: revisa la polarizacion A0/A1 del SCT-013");
     }
-    if (c.vMin < 0.05f || c.vMax > 3.25f) {
-      Serial.println("[!] Senal cerca de saturacion/recorte (corriente excesiva o polarizacion incorrecta)");
+    if (c.vMin < -1.9f || c.vMax > 1.9f) {
+      Serial.println("[!] Senal cerca de saturacion (+/-2.048 V): corriente excesiva o cableado incorrecto");
     }
     if (c.sps < 300) {
       Serial.println("[!] Frecuencia de muestreo baja, la medida puede ser imprecisa");
     }
   }
+}
+
+// ---------- Web de ajustes (siempre activa en la IP del dispositivo) ----------
+WebServer webAjustes(80);
+CurrentStats ultima = {};
+
+String paginaAjustes(const String& aviso) {
+  String h = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<title>Voltio - Ajustes</title><style>"
+             "body{font-family:system-ui;background:#0f172a;color:#e2e8f0;max-width:460px;margin:0 auto;padding:20px}"
+             "h1{color:#facc15}label{display:block;margin-top:10px;font-size:14px}"
+             "input,button{width:100%;padding:10px;margin:4px 0;border-radius:10px;border:0;font-size:16px;box-sizing:border-box}"
+             "button{background:#facc15;font-weight:700;margin-top:16px}.b{background:#1e293b;padding:12px;border-radius:10px}"
+             "small{color:#94a3b8}</style></head><body><h1>&#9889; Voltio - Ajustes</h1>";
+  if (aviso.length()) h += "<p class='b'>" + aviso + "</p>";
+  h += "<div class='b'>IP del dispositivo: <b>" + WiFi.localIP().toString() + "</b><br>WiFi: " +
+       htmlEscape(WiFi.SSID()) + " (" + String(WiFi.RSSI()) + " dBm)<br>MAC: " + WiFi.macAddress() +
+       "<br>Firmware: " + String(__DATE__) + " " + String(__TIME__) + "</div>";
+  h += "<div class='b'>&Uacute;ltima medida:<br>Irms = <b>" + String(ultima.irms, 3) + " A</b> (bruta " +
+       String(ultima.irmsRaw, 3) + ")<br>Potencia = <b>" + String(potenciaDe(ultima.irms), 1) + " W</b><br>"
+       "Vac = " + String(ultima.vrms * 1000.0f, 1) + " mV<br><small>Se actualiza al recargar la p&aacute;gina.</small></div>"
+       "<form method='POST' action='/ajustes'>"
+       "<label>Calibraci&oacute;n (A por voltio; SCT-013-030 = 30)</label>"
+       "<input name='cal' type='number' step='any' min='0.1' max='1000' value='" + String(cfg.calibration, 3) + "'>"
+       "<label>Factor de correcci&oacute;n de corriente (1.000 = sin correcci&oacute;n)</label>"
+       "<input name='corr' type='number' step='any' min='0.1' max='10' value='" + String(cfg.correction, 4) + "'>"
+       "<label>Ruido m&iacute;nimo (A; por debajo se muestra 0)</label>"
+       "<input name='noise' type='number' step='any' min='0' max='5' value='" + String(cfg.noiseFloor, 3) + "'>"
+       "<label>Tensi&oacute;n de red (V)</label>"
+       "<input name='mains' type='number' step='any' min='50' max='500' value='" + String(cfg.mains, 1) + "'>"
+       "<label>Factor de potencia (0.1 - 1.0)</label>"
+       "<input name='pf' type='number' step='any' min='0.1' max='1' value='" + String(cfg.powerFactor, 3) + "'>"
+       "<label>Intervalo de medida por serie (segundos, m&iacute;n. 1)</label>"
+       "<input name='sint' type='number' step='1' min='1' max='3600' value='" + String(cfg.serialInterval) + "'>"
+       "<button type='submit'>Guardar</button></form>"
+       "<h2>Actualizar firmware (OTA)</h2><form method='POST' action='/update' enctype='multipart/form-data'>"
+       "<input type='file' name='fw' accept='.bin' required>"
+       "<button type='submit'>Subir firmware</button></form>"
+       "<small>Usuario: admin. Archivo: .pio/build/&lt;entorno&gt;/firmware.bin</small></body></html>";
+  return h;
+}
+
+void iniciarWebAjustes() {
+  webAjustes.on("/", HTTP_GET, []() { webAjustes.send(200, "text/html", paginaAjustes("")); });
+  webAjustes.on("/ajustes", HTTP_POST, []() {
+    cfg.calibration = constrain(webAjustes.arg("cal").toFloat(), 0.1f, 1000.0f);
+    cfg.correction = constrain(webAjustes.arg("corr").toFloat(), 0.1f, 10.0f);
+    cfg.noiseFloor = constrain(webAjustes.arg("noise").toFloat(), 0.0f, 5.0f);
+    cfg.mains = constrain(webAjustes.arg("mains").toFloat(), 50.0f, 500.0f);
+    cfg.powerFactor = constrain(webAjustes.arg("pf").toFloat(), 0.1f, 1.0f);
+    cfg.serialInterval = constrain(webAjustes.arg("sint").toInt(), 1, 3600);
+    guardarAjustes();
+    Serial.printf("[cfg] cal=%.3f corr=%.4f ruido=%.3f V=%.1f FP=%.3f intervalo=%us\n", cfg.calibration,
+                  cfg.correction, cfg.noiseFloor, cfg.mains, cfg.powerFactor, cfg.serialInterval);
+    webAjustes.send(200, "text/html", paginaAjustes("Ajustes guardados."));
+  });
+  webAjustes.on("/update", HTTP_POST, []() {
+    if (!webAjustes.authenticate("admin", OTA_PASSWORD)) return webAjustes.requestAuthentication();
+    bool ok = !Update.hasError();
+    webAjustes.send(ok ? 200 : 500, "text/html",
+                    ok ? "<meta charset='utf-8'><body style='font-family:system-ui;background:#0f172a;color:#e2e8f0;padding:20px'>"
+                         "<h2>Firmware actualizado</h2><p>El dispositivo se reinicia...</p></body>"
+                       : "<meta charset='utf-8'>Error al actualizar");
+    if (ok) { delay(500); ESP.restart(); }
+  }, []() {
+    if (!webAjustes.authenticate("admin", OTA_PASSWORD)) return;
+    HTTPUpload& up = webAjustes.upload();
+    if (up.status == UPLOAD_FILE_START) {
+      Serial.printf("[OTA] Recibiendo %s\n", up.filename.c_str());
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+      Update.write(up.buf, up.currentSize);
+    } else if (up.status == UPLOAD_FILE_END) {
+      Serial.printf("[OTA] %s (%u bytes)\n", Update.end(true) ? "OK" : "FALLO", up.totalSize);
+    } else if (up.status == UPLOAD_FILE_ABORTED) {
+      Update.abort();
+    }
+  });
+  webAjustes.begin();
+  ArduinoOTA.setHostname("voltio-monitor");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.begin();
+  Serial.printf("Web de ajustes en http://%s/\n", WiFi.localIP().toString().c_str());
 }
 
 bool enviarMedicion(float irms, float potencia, float temperatura, float humedad) {
@@ -264,7 +445,8 @@ bool enviarMedicion(float irms, float potencia, float temperatura, float humedad
   payload += "\"irms\":" + String(irms, 2) + ",";
   payload += "\"power\":" + String(potencia, 2) + ",";
   payload += "\"temperature\":" + String(temperatura, 1) + ",";
-  payload += "\"humidity\":" + String(humedad, 1);
+  payload += "\"humidity\":" + String(humedad, 1) + ",";
+  payload += "\"device_ip\":\"" + WiFi.localIP().toString() + "\"";
   payload += "}";
 
   int httpCode = http.POST(payload);
@@ -281,6 +463,7 @@ void setup() {
   Serial.begin(115200);
   delay(2000); // da tiempo a que el monitor USB se conecte
   Serial.println("Arrancando...");
+  cargarAjustes();
   cargarCredenciales();
   portalConfiguracion();
   if (!conectarWifi()) {
@@ -289,6 +472,7 @@ void setup() {
     conectarWifi();
   }
 
+  iniciarWebAjustes();
   dht.begin();
 
   if (!ads.begin()) {
@@ -297,7 +481,7 @@ void setup() {
       delay(1000);
     }
   }
-  ads.setGain(GAIN_ONE);              // +/-4.096V, adecuado para una señal centrada en ~1.65V
+  ads.setGain(GAIN_TWO);              // +/-2.048V, 1 bit = 0.0625 mV (igual que el sketch básico)
   ads.setDataRate(RATE_ADS1115_860SPS);
 }
 
@@ -307,10 +491,14 @@ void loop() {
   static double irmsSum = 0;
   static unsigned irmsCount = 0;
 
+  webAjustes.handleClient();
+  ArduinoOTA.handle();
+
   if ((long)(millis() - nextMeasure) >= 0) {
-    nextMeasure = millis() + SERIAL_INTERVAL_MS;
+    nextMeasure = millis() + cfg.serialInterval * 1000UL;
     CurrentStats c = medirCorriente(MEASURE_WINDOW_MS);
     informarCorriente(c);
+    ultima = c;
     irmsSum += c.irms;
     irmsCount++;
   }
@@ -318,7 +506,7 @@ void loop() {
   if (irmsCount > 0 && millis() - lastSend >= SEND_INTERVAL_MS) {
     lastSend = millis();
     float irms = irmsSum / irmsCount;
-    float potencia = irms * MAINS_VOLTAGE;
+    float potencia = potenciaDe(irms);
     irmsSum = 0;
     irmsCount = 0;
 
